@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skill Orchestrator"
+  short_description: "Detect project signals and scaffold compact manager skills"
+  default_prompt: "Use $skill-orchestrator to integrate project skill orchestration and create compact manager skills from local manifests, configs, dependencies, scripts, and source files."
