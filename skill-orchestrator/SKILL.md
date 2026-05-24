@@ -24,9 +24,9 @@ python3 <this-skill>/scripts/bootstrap_project.py --project <project-root> --dry
 python3 <this-skill>/scripts/bootstrap_project.py --project <project-root>
 ```
 
-4. Review the reported files. If an obvious stack was missed, improve the manifest/config/dependency signal detection in `scripts/analyze_project.py` rather than adding a closed technology catalog.
+4. Review the reported files and diagnostics. If an obvious stack was missed, improve the manifest/config/dependency signal detection in `scripts/analyze_project.py` rather than adding a closed technology catalog.
 
-The bootstrap is idempotent. It updates only managed files/blocks and skips existing custom skill files it does not own.
+The bootstrap is idempotent. It updates only managed files/blocks, skips existing custom skill files it does not own, and removes stale managed `SKILL.md` files for stack skills that are no longer detected. Use `--no-cleanup-stale` only when intentionally keeping old generated skills for inspection.
 
 ## Generated Files
 
@@ -37,6 +37,8 @@ The bootstrap is idempotent. It updates only managed files/blocks and skips exis
 - `docs/tasks/`: user-visible Markdown task briefs created by `task-orchestrator`.
 
 If project `.codex/` already exists but is read-only, bootstrap uses `.skill-orchestrator/skills` and `.skill-orchestrator/manifest.json` instead. Project-local skills are routed through `AGENTS.md`; if the current Codex runtime auto-discovers them, use normal skill triggering, otherwise read the matching local `SKILL.md` when the routing block says to.
+
+Analyzer diagnostics are non-fatal. Malformed manifests, unreadable files, or max-file scan limits should be reported to the user when they affect confidence in the generated stack.
 
 ## Task Orchestrator Rule
 

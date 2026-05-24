@@ -76,6 +76,13 @@ ROOT_CONFIG_EXCLUDES = {
     "manifest",
 }
 
+KNOWN_DISPLAY_NAMES = {
+    "github": "GitHub",
+    "javascript": "JavaScript",
+    "openai": "OpenAI",
+    "typescript": "TypeScript",
+}
+
 GENERIC_SCOPED_PARTS = {
     "adapter",
     "client",
@@ -165,12 +172,23 @@ LANGUAGE_EXTENSIONS = {
 
 PACKAGE_MANAGER_MARKERS = (
     ("pnpm-lock.yaml", "pnpm"),
+    ("pnpm-workspace.yaml", "pnpm"),
     ("yarn.lock", "yarn"),
+    (".yarnrc.yml", "yarn"),
     ("package-lock.json", "npm"),
     ("bun.lockb", "bun"),
     ("bun.lock", "bun"),
+    ("deno.json", "deno"),
+    ("deno.jsonc", "deno"),
+    ("deno.lock", "deno"),
     ("uv.lock", "uv"),
     ("poetry.lock", "poetry"),
+    ("pipfile", "pipenv"),
+    ("pipfile.lock", "pipenv"),
+    ("cargo.lock", "cargo"),
+    ("go.sum", "go"),
+    ("composer.lock", "composer"),
+    ("gemfile.lock", "bundler"),
 )
 
 
@@ -186,30 +204,50 @@ class Candidate:
     checks: set[str] = field(default_factory=set)
 
 
-def read_json(path: Path) -> dict[str, Any]:
+def add_diagnostic(diagnostics: list[str] | None, message: str) -> None:
+    if diagnostics is not None and message not in diagnostics:
+        diagnostics.append(message)
+
+
+def read_json(path: Path, diagnostics: list[str] | None = None, label: str | None = None) -> dict[str, Any]:
+    source = label or path.as_posix()
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    except json.JSONDecodeError as exc:
+        add_diagnostic(diagnostics, f"{source}: invalid JSON ({exc.msg})")
+    except OSError as exc:
+        add_diagnostic(diagnostics, f"{source}: could not read JSON ({exc.__class__.__name__})")
+    except Exception as exc:
+        add_diagnostic(diagnostics, f"{source}: could not parse JSON ({exc.__class__.__name__})")
+    return {}
 
 
-def read_toml(path: Path) -> dict[str, Any]:
+def read_toml(path: Path, diagnostics: list[str] | None = None, label: str | None = None) -> dict[str, Any]:
+    source = label or path.as_posix()
     if tomllib is None:
+        add_diagnostic(diagnostics, f"{source}: TOML parsing requires Python 3.11+")
         return {}
     try:
         return tomllib.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    except tomllib.TOMLDecodeError as exc:
+        add_diagnostic(diagnostics, f"{source}: invalid TOML ({exc})")
+    except OSError as exc:
+        add_diagnostic(diagnostics, f"{source}: could not read TOML ({exc.__class__.__name__})")
+    except Exception as exc:
+        add_diagnostic(diagnostics, f"{source}: could not parse TOML ({exc.__class__.__name__})")
+    return {}
 
 
-def read_text(path: Path, limit: int = 250_000) -> str:
+def read_text(path: Path, limit: int = 250_000, diagnostics: list[str] | None = None, label: str | None = None) -> str:
+    source = label or path.as_posix()
     try:
         return path.read_text(encoding="utf-8", errors="ignore")[:limit]
-    except Exception:
+    except OSError as exc:
+        add_diagnostic(diagnostics, f"{source}: could not read text ({exc.__class__.__name__})")
         return ""
 
 
-def collect_files(root: Path, max_files: int) -> list[str]:
+def collect_files(root: Path, max_files: int, diagnostics: list[str] | None = None) -> list[str]:
     files: list[str] = []
     for current, dirs, names in os.walk(root):
         dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS and not d.startswith(".cache")]
@@ -218,6 +256,10 @@ def collect_files(root: Path, max_files: int) -> list[str]:
             rel = (rel_dir / name).as_posix() if rel_dir.as_posix() != "." else name
             files.append(rel)
             if len(files) >= max_files:
+                add_diagnostic(
+                    diagnostics,
+                    f"file scan reached --max-files={max_files}; stack signals may be incomplete",
+                )
                 return files
     return files
 
@@ -243,6 +285,9 @@ def pretty_display(value: str) -> str:
     value = value.strip()
     if not value:
         return "Detected Stack Item"
+    known = KNOWN_DISPLAY_NAMES.get(value.lower())
+    if known:
+        return known
     if value.startswith("@") or "/" in value:
         return value
     words = re.split(r"[-_\s]+", value)
@@ -353,7 +398,7 @@ def package_data(root: Path, files: list[str]) -> tuple[dict[str, str], dict[str
     for rel in files:
         if not rel.endswith("package.json"):
             continue
-        data = read_json(root / rel)
+        data = read_json(root / rel, label=rel)
         for section in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
             for name, version in data.get(section, {}).items():
                 deps.setdefault(name, str(version))
@@ -442,11 +487,57 @@ def validation_checks(scripts: dict[str, str]) -> list[str]:
     return checks[:5]
 
 
-def package_json_signals(root: Path, files: list[str], candidates: dict[str, Candidate]) -> dict[str, str]:
+def normalize_package_manager_name(value: str) -> str | None:
+    name = value.strip().lower()
+    if not name:
+        return None
+    if "@" in name and not name.startswith("@"):
+        name = name.split("@", 1)[0]
+    aliases = {
+        "yarnpkg": "yarn",
+    }
+    name = aliases.get(name, name)
+    if name in {"bun", "cargo", "composer", "deno", "go", "npm", "pipenv", "pnpm", "poetry", "uv", "yarn"}:
+        return name
+    return None
+
+
+def package_managers_from_project(root: Path, files: list[str], diagnostics: list[str]) -> list[str]:
+    managers: set[str] = set()
+    marker_lookup = {marker: manager for marker, manager in PACKAGE_MANAGER_MARKERS}
+    for rel in files:
+        name = Path(rel).name.lower()
+        manager = marker_lookup.get(name)
+        if manager:
+            managers.add(manager)
+
+        if Path(rel).name == "package.json":
+            data = read_json(root / rel, diagnostics, rel)
+            package_manager = normalize_package_manager_name(str(data.get("packageManager", "")))
+            if package_manager:
+                managers.add(package_manager)
+
+        if Path(rel).name == "pyproject.toml":
+            data = read_toml(root / rel, diagnostics, rel)
+            tool_config = data.get("tool", {}) or {}
+            if "poetry" in tool_config:
+                managers.add("poetry")
+            if "uv" in tool_config:
+                managers.add("uv")
+
+    return sorted(managers)
+
+
+def package_json_signals(
+    root: Path,
+    files: list[str],
+    candidates: dict[str, Candidate],
+    diagnostics: list[str],
+) -> dict[str, str]:
     all_scripts: dict[str, str] = {}
     package_json_files = [rel for rel in files if rel.endswith("package.json")]
     for rel in package_json_files:
-        data = read_json(root / rel)
+        data = read_json(root / rel, diagnostics, rel)
         scripts = {name: str(command) for name, command in data.get("scripts", {}).items()}
         all_scripts.update({name: command for name, command in scripts.items() if name not in all_scripts})
         add_candidate(
@@ -511,10 +602,10 @@ def add_python_requirement(
     add_package_candidate(candidates, name, section=section, source=source)
 
 
-def pyproject_signals(root: Path, files: list[str], candidates: dict[str, Candidate]) -> None:
+def pyproject_signals(root: Path, files: list[str], candidates: dict[str, Candidate], diagnostics: list[str]) -> None:
     pyproject_files = [rel for rel in files if rel.endswith("pyproject.toml")]
     for rel in pyproject_files:
-        data = read_toml(root / rel)
+        data = read_toml(root / rel, diagnostics, rel)
         add_candidate(
             candidates,
             "python-project",
@@ -566,7 +657,7 @@ def pyproject_signals(root: Path, files: list[str], candidates: dict[str, Candid
                 )
 
 
-def requirements_signals(root: Path, files: list[str], candidates: dict[str, Candidate]) -> None:
+def requirements_signals(root: Path, files: list[str], candidates: dict[str, Candidate], diagnostics: list[str]) -> None:
     for rel in files:
         name = Path(rel).name.lower()
         if not (name == "requirements.txt" or name.startswith("requirements-") and name.endswith(".txt")):
@@ -580,15 +671,15 @@ def requirements_signals(root: Path, files: list[str], candidates: dict[str, Can
             display="Python project",
             research_terms={"requirements.txt", "Python packaging"},
         )
-        for line in read_text(root / rel).splitlines():
+        for line in read_text(root / rel, diagnostics=diagnostics, label=rel).splitlines():
             add_python_requirement(candidates, line, section="project.dependencies", source=rel)
 
 
-def cargo_signals(root: Path, files: list[str], candidates: dict[str, Candidate]) -> None:
+def cargo_signals(root: Path, files: list[str], candidates: dict[str, Candidate], diagnostics: list[str]) -> None:
     for rel in files:
         if not rel.endswith("Cargo.toml"):
             continue
-        data = read_toml(root / rel)
+        data = read_toml(root / rel, diagnostics, rel)
         add_candidate(
             candidates,
             "rust-cargo-project",
@@ -603,7 +694,7 @@ def cargo_signals(root: Path, files: list[str], candidates: dict[str, Candidate]
                 add_package_candidate(candidates, str(name), section=section, source=rel, version=str(version))
 
 
-def go_mod_signals(root: Path, files: list[str], candidates: dict[str, Candidate]) -> None:
+def go_mod_signals(root: Path, files: list[str], candidates: dict[str, Candidate], diagnostics: list[str]) -> None:
     for rel in files:
         if not rel.endswith("go.mod"):
             continue
@@ -617,7 +708,7 @@ def go_mod_signals(root: Path, files: list[str], candidates: dict[str, Candidate
             research_terms={"go.mod", "Go modules"},
         )
         in_require_block = False
-        for raw_line in read_text(root / rel).splitlines():
+        for raw_line in read_text(root / rel, diagnostics=diagnostics, label=rel).splitlines():
             line = raw_line.strip()
             if not line or line.startswith("//"):
                 continue
@@ -638,11 +729,11 @@ def go_mod_signals(root: Path, files: list[str], candidates: dict[str, Candidate
                     add_package_candidate(candidates, parts[0], section="require", source=rel, version=parts[1])
 
 
-def composer_signals(root: Path, files: list[str], candidates: dict[str, Candidate]) -> None:
+def composer_signals(root: Path, files: list[str], candidates: dict[str, Candidate], diagnostics: list[str]) -> None:
     for rel in files:
         if not rel.endswith("composer.json"):
             continue
-        data = read_json(root / rel)
+        data = read_json(root / rel, diagnostics, rel)
         add_candidate(
             candidates,
             "php-composer-project",
@@ -658,7 +749,7 @@ def composer_signals(root: Path, files: list[str], candidates: dict[str, Candida
                     add_package_candidate(candidates, str(name), section=section, source=rel, version=str(version))
 
 
-def gemfile_signals(root: Path, files: list[str], candidates: dict[str, Candidate]) -> None:
+def gemfile_signals(root: Path, files: list[str], candidates: dict[str, Candidate], diagnostics: list[str]) -> None:
     for rel in files:
         if Path(rel).name != "Gemfile":
             continue
@@ -671,7 +762,7 @@ def gemfile_signals(root: Path, files: list[str], candidates: dict[str, Candidat
             display="Ruby/Bundler project",
             research_terms={"Gemfile", "Ruby Bundler"},
         )
-        for line in read_text(root / rel).splitlines():
+        for line in read_text(root / rel, diagnostics=diagnostics, label=rel).splitlines():
             match = re.match(r"\s*gem\s+['\"]([^'\"]+)['\"]", line)
             if match:
                 add_package_candidate(candidates, match.group(1), section="dependencies", source=rel)
@@ -809,17 +900,17 @@ def finalize_candidate(candidate: Candidate, default_checks: list[str]) -> dict[
 
 def analyze_project(root: Path, max_files: int = 8000) -> dict[str, Any]:
     root = root.resolve()
-    files = collect_files(root, max_files)
-    file_set = set(files)
+    diagnostics: list[str] = []
+    files = collect_files(root, max_files, diagnostics)
     candidates: dict[str, Candidate] = {}
 
-    scripts = package_json_signals(root, files, candidates)
-    pyproject_signals(root, files, candidates)
-    requirements_signals(root, files, candidates)
-    cargo_signals(root, files, candidates)
-    go_mod_signals(root, files, candidates)
-    composer_signals(root, files, candidates)
-    gemfile_signals(root, files, candidates)
+    scripts = package_json_signals(root, files, candidates, diagnostics)
+    pyproject_signals(root, files, candidates, diagnostics)
+    requirements_signals(root, files, candidates, diagnostics)
+    cargo_signals(root, files, candidates, diagnostics)
+    go_mod_signals(root, files, candidates, diagnostics)
+    composer_signals(root, files, candidates, diagnostics)
+    gemfile_signals(root, files, candidates, diagnostics)
     ecosystem_manifest_signals(files, candidates)
     config_signals(files, candidates, scripts)
     language_signals(files, candidates)
@@ -830,17 +921,13 @@ def analyze_project(root: Path, max_files: int = 8000) -> dict[str, Any]:
     for item in detected_list:
         item.pop("score", None)
 
-    package_managers = []
-    for marker, name in PACKAGE_MANAGER_MARKERS:
-        if marker in file_set:
-            package_managers.append(name)
-
     return {
         "project_root": str(root),
         "file_count_scanned": len(files),
-        "package_managers": sorted(set(package_managers)),
+        "package_managers": package_managers_from_project(root, files, diagnostics),
         "package_scripts": scripts,
         "detected": detected_list,
+        "diagnostics": diagnostics,
     }
 
 
@@ -851,11 +938,15 @@ def print_human(report: dict[str, Any]) -> None:
     print("Detected stack:")
     if not report["detected"]:
         print("- none")
-        return
-    for item in report["detected"]:
-        signals = "; ".join(item["signals"])
-        kind = item.get("kind", "stack")
-        print(f"- {item['display']} -> {item['skill_name']} [{kind}] ({signals})")
+    else:
+        for item in report["detected"]:
+            signals = "; ".join(item["signals"])
+            kind = item.get("kind", "stack")
+            print(f"- {item['display']} -> {item['skill_name']} [{kind}] ({signals})")
+    if report.get("diagnostics"):
+        print("Diagnostics:")
+        for diagnostic in report["diagnostics"]:
+            print(f"- {diagnostic}")
 
 
 def main() -> int:

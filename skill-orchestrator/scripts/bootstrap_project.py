@@ -238,10 +238,44 @@ def ensure_directory(path: Path, dry_run: bool, changes: list[str]) -> None:
         path.mkdir(parents=True, exist_ok=True)
 
 
-def bootstrap(project: Path, dry_run: bool, max_stack_skills: int, local_dir: str) -> dict[str, Any]:
+def remove_stale_managed_skills(
+    skills_dir: Path,
+    expected_skill_names: set[str],
+    dry_run: bool,
+    changes: list[str],
+) -> None:
+    if not skills_dir.is_dir():
+        return
+
+    for skill_file in sorted(skills_dir.glob("*/SKILL.md")):
+        skill_dir = skill_file.parent
+        if skill_dir.name in expected_skill_names:
+            continue
+        old = skill_file.read_text(encoding="utf-8", errors="ignore")
+        if MANAGED_MARKER not in old:
+            continue
+
+        changes.append(f"remove stale managed skill {skill_file}")
+        if dry_run:
+            continue
+        skill_file.unlink()
+        try:
+            skill_dir.rmdir()
+        except OSError:
+            pass
+
+
+def bootstrap(
+    project: Path,
+    dry_run: bool,
+    max_stack_skills: int,
+    local_dir: str,
+    cleanup_stale: bool = True,
+) -> dict[str, Any]:
     project = project.resolve()
     report = analyze_project(project)
     selected = report["detected"][:max_stack_skills]
+    generated_skill_names = {"task-orchestrator", *(item["skill_name"] for item in selected)}
     layout = choose_layout(project, local_dir)
     skills_dir = layout["skills"]
     task_dir = project / "docs" / "tasks"
@@ -265,6 +299,9 @@ def bootstrap(project: Path, dry_run: bool, max_stack_skills: int, local_dir: st
             changes,
         )
 
+    if cleanup_stale:
+        remove_stale_managed_skills(skills_dir, generated_skill_names, dry_run, changes)
+
     agents_path = project / "AGENTS.md"
     existing_agents = agents_path.read_text(encoding="utf-8", errors="ignore") if agents_path.exists() else ""
     write_text(agents_path, upsert_agents(existing_agents, agents_block(selected, skills_dir, project)), dry_run, changes)
@@ -275,9 +312,11 @@ def bootstrap(project: Path, dry_run: bool, max_stack_skills: int, local_dir: st
         "project_root": str(project),
         "dry_run": dry_run,
         "local_base": relative(layout["base"], project),
+        "cleanup_stale": cleanup_stale,
         "package_managers": report["package_managers"],
         "generated_skills": ["task-orchestrator"] + [item["skill_name"] for item in selected],
         "detected": report["detected"],
+        "diagnostics": report.get("diagnostics", []),
     }
     if not dry_run:
         write_text(
@@ -295,6 +334,7 @@ def bootstrap(project: Path, dry_run: bool, max_stack_skills: int, local_dir: st
         "local_base": relative(layout["base"], project),
         "changes": changes,
         "detected": selected,
+        "diagnostics": report.get("diagnostics", []),
     }
 
 
@@ -308,10 +348,21 @@ def main() -> int:
         default="auto",
         help="Where to place local orchestration files: auto, .codex, .skill-orchestrator, or another relative path",
     )
+    parser.add_argument(
+        "--no-cleanup-stale",
+        action="store_true",
+        help="Leave previously generated managed stack skills in place even if they are no longer detected",
+    )
     parser.add_argument("--json", action="store_true", help="Print JSON output")
     args = parser.parse_args()
 
-    result = bootstrap(Path(args.project), args.dry_run, args.max_stack_skills, args.local_dir)
+    result = bootstrap(
+        Path(args.project),
+        args.dry_run,
+        args.max_stack_skills,
+        args.local_dir,
+        cleanup_stale=not args.no_cleanup_stale,
+    )
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
@@ -324,6 +375,10 @@ def main() -> int:
                 print(f"- {item['display']} -> {item['skill_name']}")
         else:
             print("- none")
+        if result["diagnostics"]:
+            print("Diagnostics:")
+            for diagnostic in result["diagnostics"]:
+                print(f"- {diagnostic}")
         print("Changes:")
         for change in result["changes"]:
             print(f"- {change}")

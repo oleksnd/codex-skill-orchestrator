@@ -27,3 +27,10 @@ Use $skill-orchestrator to connect itself to this project.
 ```
 
 The skill will analyze the project stack and create/update only managed orchestration files. It uses `.codex/skills` when available and falls back to `.skill-orchestrator/skills` if project `.codex` is read-only.
+
+## Quality Checks
+
+```bash
+python3 -m unittest discover -s tests
+python3 <skill-creator>/scripts/quick_validate.py skill-orchestrator
+```
